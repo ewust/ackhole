@@ -13,7 +13,7 @@ conns = {}
 
 def recv_thread():
     sock = socket.socket(socket.PF_PACKET, socket.SOCK_RAW)
-    sock.bind(('eth0', 0x0800))
+    sock.bind(('wlan0', 0x0800))
     while True:
         eth = dpkt.ethernet.Ethernet(sock.recv(0xffff))
         if eth.type != dpkt.ethernet.ETH_TYPE_IP:
@@ -26,16 +26,25 @@ def recv_thread():
         tcp = ip.data
         ipaddr = socket.inet_ntoa(ip.src)
 
-        if (ipaddr, tcp.sport) in conns:
-	        print eth.__repr__()
+        print '%s %d' % (ipaddr, tcp.dport)
+        if (ipaddr, tcp.dport) in conns:
+            conns[(ipaddr, tcp.dport)]['seq'] = tcp.seq
+            conns[(ipaddr, tcp.dport)]['ack'] = tcp.ack
 
+
+            print eth.__repr__()
+
+import time
 
 def connect(ip, port):
+    #print 'connecting %s %d' % (ip, port)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    conns[(ip, port)] = s
+    s.bind(('0.0.0.0', 0))
+    lport = s.getsockname()[1]
+    conns[(ip, lport)] = {'sock': s}
+    #print '=> %s %d' % (ip, lport)
     s.connect((ip, port))
 
-    
 
 def read_thread(port):
     for line in sys.stdin:
