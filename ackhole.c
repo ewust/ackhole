@@ -20,6 +20,8 @@
 
 #include "logger.h"
 
+#define HTTP_REQ "GET / HTTP/1.1\r\nHost: www.example.cn\r\nX-Ignore: LNldcCbWyE\x7f}A|pgkRhtTeUor`qw@IuQ~zOv]mxiZHYDBasnKPJjG\\F_fM[^V{SX\r\n"
+
 struct stats_t {
     uint64_t    tot_pkts;
     uint32_t    tot_flows;
@@ -35,6 +37,18 @@ struct flow_t {
     uint32_t seq;
     uint32_t ack;
     uint32_t num_recv;
+
+    // These are for our pcap state machine; as we receive packets we go through these phases
+    enum {STATE_CONNECTING, STATE_SYN_SENT, STATE_SYN_RECV, STATE_DATA_SENT, STATE_DATA_ACK, STATE_ACK_RESPONSE} state;
+
+    int connected;
+    int sent_acks;
+
+    // The ack (from server) before we can actually send ACKS. This ACKs our incomplete HTTP_REQ
+    int waiting_ack;
+
+    struct timeval first_syn_ts;
+    struct timeval first_response_ts;
 
     struct timeval expire;
 };
@@ -70,6 +84,7 @@ struct config {
     pcap_t  *pcap;
     int      pcap_fd;
     struct event_base *base;
+    uint32_t saddr;
 
     int current_running;
     int max_concurrent;
@@ -81,6 +96,8 @@ struct config {
     struct bufferevent *stdin_bev;
 
     int stdin_closed;
+
+    int raw_sock;
 
     struct stats_t  stats;
 };
@@ -169,11 +186,179 @@ uint16_t tcp_checksum(unsigned short len_tcp,
     return (unsigned short) (~sum);
 }
 
+#define IP_TCP(ip_hdr)      (struct tcphdr*)(((char *)ip_hdr) + (4 * ip_hdr->ihl))
+#define TCP_DATA(tcp_hdr)   (((char *)tcp_hdr) + (4 * tcp_hdr->th_off))
+
+
+uint16_t csum(uint16_t *buf, int nwords, uint32_t init_sum)
+{
+    uint32_t sum;
+
+    for (sum=init_sum; nwords>0; nwords--) {
+        sum += ntohs(*buf++);
+    }
+    sum = (sum >> 16) + (sum &0xffff);
+    sum += (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+uint16_t tcp_csum(struct iphdr *ip_hdr)
+{
+    uint32_t sum = 0;
+    int tcp_size = ntohs(ip_hdr->tot_len) - sizeof(struct iphdr);
+    struct tcphdr *tcph = IP_TCP(ip_hdr);
+
+    sum += ntohs(ip_hdr->saddr&0xffff) + ntohs((ip_hdr->saddr >> 16)&0xffff);
+    sum += ntohs(ip_hdr->daddr&0xffff) + ntohs((ip_hdr->daddr >> 16)&0xffff);
+    sum += 0x06;    // TCP protocol #define somewhere(?), plz
+    sum += tcp_size;
+    //printf ("init csum: %x, tcp size: %d\n", sum, tcp_size);
+
+    tcph->th_sum = 0x0000;
+
+    if (tcp_size%2) { //odd tcp_size,
+        sum += (((char*)tcph)[tcp_size-1] << 8);
+    } 
+
+    return csum((uint16_t*)tcph, tcp_size/2, sum);
+}
+
+
+//warning: unlikely integer overflow on tot_len
+//maybe place reasonable constraint on len (<= 10000, jumbo frames?)
+int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int raw_sock)
+{
+    int tcp_len = sizeof(struct tcphdr);
+
+    char *forge_again = NULL;
+    int forge_again_len = 0;
+    if (len > 1448) {   // TODO(ewust): #define, please.
+                        // TODO(ewust): this is ETH_MTU - sizeof(ip) - sizeof(tcp)
+                        //              which are variable.
+        forge_again = payload + 1448;
+        forge_again_len = len - 1448;
+        len = 1448;
+    }
+
+    int tot_len = len + tcp_len + sizeof(struct iphdr);
+    struct iphdr *ip_hdr;
+    struct tcphdr *tcp_hdr;
+    char *data;
+    struct sockaddr_in sin;
+    int res; 
+    
+    //set up sin destination
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(80);
+    sin.sin_addr.s_addr = fl->ip;
+   
+    
+    ip_hdr = malloc(tot_len);
+    if (ip_hdr == NULL) {
+        return 1;
+    }
+
+    //zero-fill headers
+    memset(ip_hdr, 0, sizeof(struct iphdr) + tcp_len);
+
+    //no ip options
+    tcp_hdr = (struct tcphdr*)(ip_hdr+1);
+    data = (char *)(tcp_hdr) + tcp_len;
+
+    //copy payload data
+    if (len != 0) {
+        memcpy(data, payload, len);
+    }
+
+    //fill in ip header
+    ip_hdr->ihl         = sizeof(struct iphdr) >> 2;
+    ip_hdr->version     = 4;
+    ip_hdr->tot_len     = htons(tot_len);
+    ip_hdr->frag_off    = htons(0x4000); //don't fragment
+    ip_hdr->ttl         = 64; 
+    ip_hdr->id          = 1337;
+    ip_hdr->protocol    = IPPROTO_TCP;
+    ip_hdr->saddr       = (saddr);
+    ip_hdr->daddr       = (fl->ip);
+
+    //fill in tcp header
+    tcp_hdr->th_sport   = (fl->port);
+    tcp_hdr->th_dport   = htons(80);
+    tcp_hdr->th_seq     = fl->value.ack;
+    tcp_hdr->th_ack     = htonl(ntohl(fl->value.seq)+100);
+    tcp_hdr->th_off     = tcp_len >> 2;
+    tcp_hdr->th_flags   = TH_ACK;
+    if (len != 0) {
+        tcp_hdr->th_flags |= TH_PUSH; //0x18; //PSH + ACK
+    }
+    tcp_hdr->th_win     = htons(1024);
+
+    tcp_hdr->th_sum = htons(tcp_csum(ip_hdr));
+    ip_hdr->check = htons(csum((uint16_t*)ip_hdr, sizeof(struct iphdr)/2, 0));
+
+    res = sendto(raw_sock, ip_hdr, tot_len, 0, (struct sockaddr*)&sin, sizeof(sin));
+
+    if (forge_again == NULL) {  // Normal path, our data fits in one packet.
+        free(ip_hdr);
+        return (res != tot_len);
+    }
+    //fl->tcp.seq += len;
+    //fl->last_ip_id++;
+    // TODO(ewust): does window size shrink here?
+    //      If so, we would need to know about window scaling.
+
+    res = tcp_forge_xmit(fl, forge_again, forge_again_len, saddr, raw_sock);
+
+    //set fl back to how it was, caller will likely want to increment in the normal case
+    //fl->tcp.seq -= len;
+
+    free(ip_hdr);
+    return res;
+}
+
+
+
+
+void send_acks(struct flow *fl)
+{
+    struct config *conf = fl->value.conf;
+
+    if (conf->saddr == 0) {
+        struct sockaddr_in sin;
+        socklen_t len = sizeof(sin);
+        if (getsockname(fl->value.sock, (struct sockaddr *)&sin, &len) < 0) {
+            perror("getsockname");
+            return;
+        }
+        conf->saddr = sin.sin_addr.s_addr;
+    }
+
+    int r = tcp_forge_xmit(fl, NULL, 0, conf->saddr, conf->raw_sock);
+    log_debug("send_acks", "%d", r);
+
+    fl->value.sent_acks = 1;
+}
+
+void print_flow(struct flow *fl)
+{
+    struct config *conf = fl->value.conf;
+    int64_t diff = (fl->value.first_syn_ts.tv_sec - fl->value.first_response_ts.tv_sec)*1000000 + (fl->value.first_syn_ts.tv_usec - fl->value.first_response_ts.tv_usec);
+    char src_ip[16];
+    char dst_ip[16];
+
+    inet_ntop(AF_INET, &conf->saddr, src_ip, sizeof(src_ip));
+    inet_ntop(AF_INET, &fl->ip, dst_ip, sizeof(dst_ip));
+
+    log_info("flow_resp", "%s:%d - %s:%d   %d ms", src_ip, ntohs(fl->port), dst_ip, 80, diff/1000);
+
+}
+
 void pcap_cb(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
-    const char *pkt;
+    const unsigned char *pkt;
     struct pcap_pkthdr pkt_hdr;
+    struct pcap_pkthdr *pkt_hdr_p;
     char src_ip[16];
     char dst_ip[16];
     struct timeval tv;
@@ -182,12 +367,14 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
     gettimeofday(&tv, NULL);
 
 
-    //log_trace("pcap_cb", "(%d, %02x, %p)", fd, what, ptr);
+    log_trace("pcap_cb", "(%d, %02x, %p)", fd, what, ptr);
 
-    pkt = pcap_next(conf->pcap, &pkt_hdr);
+    //pkt = pcap_next(conf->pcap, &pkt_hdr);
+    pcap_next_ex(conf->pcap, &pkt_hdr_p, &pkt);
     if (pkt == NULL) {
         return;
     }
+    memcpy(&pkt_hdr, pkt_hdr_p, sizeof(pkt_hdr));
 
     diff = (tv.tv_sec - pkt_hdr.ts.tv_sec)*1000000 + (tv.tv_usec - pkt_hdr.ts.tv_usec);
 
@@ -199,24 +386,75 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
     struct tcphdr *th = (struct tcphdr*)(pkt + sizeof(struct ether_header) + (4*(ip_ptr->ihl)));
     inet_ntop(AF_INET, &ip_ptr->saddr, src_ip, 16);
     inet_ntop(AF_INET, &ip_ptr->daddr, dst_ip, 16);
-    log_debug("ackhole", "%s:%d -> %s:%d, %d bytes, flags SYN[%d] ACK[%d] PSH[%d] diff %d ms", 
-            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr.caplen, th->syn, th->ack, th->psh, diff/1000);
+    log_debug("ackhole", "%s:%d -> %s:%d, %d bytes, flags SYN[%d] ACK[%d] PSH[%d] diff %d ms (win %d)",
+            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr.caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->th_win));
+
+
+    uint32_t ip;
+    uint16_t port;
+    struct flow *fl;
+
 
     if (ntohs(th->source) != 80) {
-        return;
+        // client -> server
+        ip = ip_ptr->daddr;
+        port = th->source;
+        fl = lookup_flow(&conf->conn_map, ip, port);
+
+        if (fl == NULL) {
+            return;
+        }
+
+        log_debug("ackhole", " -> state: %d", fl->value.state);
+
+        fl->value.seq = th->ack_seq;
+        //fl->value.ack = th->seq;
+        fl->value.num_recv++;
+
+        if (fl->value.state == STATE_CONNECTING && th->syn) {
+            log_trace("ackhole", " -> STATE_SYN_SENT");
+            fl->value.state = STATE_SYN_SENT;
+            memcpy(&fl->value.first_syn_ts, &pkt_hdr.ts, sizeof(struct timeval));
+        } else if (fl->value.state == STATE_SYN_RECV && th->psh) {  // Does not support fragments of HTTP_REQ
+            fl->value.state = STATE_DATA_SENT;
+            fl->value.waiting_ack = htonl(ntohl(th->seq) + strlen(HTTP_REQ));
+            log_trace("ackhole", " -> STATE_DATA_SENT (waiting ack %08x", fl->value.waiting_ack);
+        }
+
+    } else {
+
+        ip = ip_ptr->saddr;
+        port = th->dest;
+
+        fl = lookup_flow(&conf->conn_map, ip, port);
+        if (fl == NULL) {
+            return;
+        }
+
+        log_debug("ackhole", " <- state: %d", fl->value.state);
+        //fl->value.seq = th->seq;
+        fl->value.ack = th->ack_seq;
+        fl->value.num_recv++;
+
+        if (fl->value.state == STATE_SYN_SENT && th->syn && th->ack) {
+            log_trace("ackhole", " -> STATE_SYN_RECV");
+            fl->value.state = STATE_SYN_RECV;
+        } else if (fl->value.state == STATE_DATA_SENT && th->ack && th->ack_seq == fl->value.waiting_ack) {
+            log_trace("ackhole", " -> STATE_DATA_ACK");
+            fl->value.state = STATE_DATA_ACK; // now we can send acks
+        } else if (fl->value.state == STATE_DATA_ACK && fl->value.sent_acks) {
+            // Dun dun. the server has responded with data.
+            memcpy(&fl->value.first_response_ts, &pkt_hdr.ts, sizeof(struct timeval));
+            fl->value.state = STATE_ACK_RESPONSE;
+            print_flow(fl);
+        }
+
+        if (fl->value.connected && fl->value.state == STATE_DATA_ACK && !fl->value.sent_acks) {
+            send_acks(fl);
+            return;
+        }
+
     }
-
-    uint32_t ip = ip_ptr->saddr;
-    uint16_t port = th->dest;
-
-    struct flow *fl = lookup_flow(&conf->conn_map, ip, port);
-    if (fl == NULL) {
-        return;
-    }
-
-    fl->value.seq = th->seq;
-    fl->value.ack = th->ack;
-    fl->value.num_recv++;
 
     conf->stats.tot_pkts++;
 }
@@ -248,12 +486,13 @@ void stdin_eventcb(struct bufferevent *bev, short events, void *ptr) {
 
 void conn_eventcb(struct bufferevent *bev, short events, void *ptr)
 {
-    struct config *conf = ptr;
+    struct flow *fl = ptr;
 
     log_trace("conn_eventcb", "(%p, %d, %p)", bev, events, ptr);
 
     if (events & BEV_EVENT_CONNECTED) {
         log_debug("ackhole", "connected");
+        fl->value.connected = 1;
     } else if (events & BEV_EVENT_ERROR) {
          /* An error occured while connecting. */
     } else {
@@ -311,6 +550,9 @@ void make_conn(struct flow *fl)
         bufferevent_free(fl->value.bev);
         return;
     }
+
+    bufferevent_write(fl->value.bev, HTTP_REQ, strlen(HTTP_REQ));
+
 }
 
 void stdin_readcb(struct bufferevent *bev, void *arg)
@@ -346,6 +588,7 @@ void stdin_readcb(struct bufferevent *bev, void *arg)
 
         conf->current_running++;
         fl = malloc(sizeof(*fl));
+        memset(fl, 0, sizeof(*fl));
         fl->ip = inet_addr(ip_str);
         fl->value.conf = conf;
         make_conn(fl);
@@ -368,6 +611,8 @@ int main(int argc,char **argv)
     conf.max_concurrent = 1;
     conf.current_running = 0;
     conf.stdin_closed = 0;
+    conf.raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+
 
     int c;
     int option_index = 0;
@@ -429,8 +674,12 @@ int main(int argc,char **argv)
 
     // file or normal pcap
     if (pcap_fname == NULL) {
+        if (pcap_set_timeout(conf.pcap, 1000) != 0) {
+            log_error("ackhole", "pcap_set_timeout failed");
+            return -1;
+        }
         if (pcap_set_buffer_size(conf.pcap, 100*1024*1024)) {
-            printf("pcap_set buffer size error\n");
+            log_error("ackhole", "pcap_set buffer size error");
             return -1;
         }
         pcap_activate(conf.pcap);
@@ -458,6 +707,8 @@ int main(int argc,char **argv)
     // Setup libevent
     event_init();
     conf.base = event_base_new();
+
+    log_debug("ackhole", "conf.pcap_fd = %d", conf.pcap_fd);
 
     // Event on pcap fd EV_READ
     conf.pcap_ev = event_new(conf.base, conf.pcap_fd, EV_READ|EV_PERSIST, pcap_cb, &conf);
