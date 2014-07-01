@@ -559,7 +559,7 @@ void print_status(evutil_socket_t fd, short what, void *ptr)
 
     int num_removed = cleanup_expired(conf);
 
-    log_info("ackhole", "%d/%d flows (cleaned up %d) %lu pkts", conf->current_running, conf->max_concurrent, num_removed, conf->stats.tot_pkts);
+    log_info("ackhole", "%d/%d flows (cleaned up %d) %d flows (%lu pkts)", conf->current_running, conf->max_concurrent, num_removed, conf->stats.tot_flows, conf->stats.tot_pkts);
 
 }
 
