@@ -270,9 +270,15 @@ void make_conn(struct flow *fl)
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = inet_addr("0.0.0.0");
+    sin.sin_port = htons(0);
 
     // Bind and get our source port for the conn_map
     fl->value.sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (fl->value.sock < 0) {
+        perror("socket");
+        return;
+    }
     if (bind(fl->value.sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
         perror("bind");
         // TODO: cleanup
@@ -280,7 +286,7 @@ void make_conn(struct flow *fl)
     }
 
     // Get the port we are bound to
-    socklen_t len;
+    socklen_t len = sizeof(sin);
     if (getsockname(fl->value.sock, (struct sockaddr *)&sin, &len) < 0) {
         perror("getsockname");
         // Cleanup
