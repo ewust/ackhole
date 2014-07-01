@@ -470,7 +470,7 @@ void print_status(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
 
-    log_info("ackhole", "%lu pkts", conf->stats.tot_pkts);
+    log_info("ackhole", "%d/%d flows %lu pkts", conf->current_running, conf->max_concurrent, conf->stats.tot_pkts);
 
 }
 
