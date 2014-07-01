@@ -716,10 +716,11 @@ int main(int argc,char **argv)
         {"concurrent", optional_argument, 0, 'c'},
         {"iface",   optional_argument, 0, 'i'},
         {"file", optional_argument, 0, 'f'},
+        {"verbosity", optional_argument, 0, 'v'},
         {0, 0, 0, 0}
     };
     while (1) {
-        c = getopt_long(argc, argv, "i:f:", long_options, &option_index);
+        c = getopt_long(argc, argv, "c:i:f:v:", long_options, &option_index);
         if (c == -1)
             break;
 
@@ -738,6 +739,9 @@ int main(int argc,char **argv)
             break;
         case 'f':
             pcap_fname = optarg;
+            break;
+        case 'v':
+            log_init(stdout, atoi(optarg), 0, NULL);
             break;
         }
     }
