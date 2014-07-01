@@ -282,12 +282,12 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     ip_hdr->daddr       = (fl->ip);
 
     //fill in tcp header
-    tcp_hdr->source   = (fl->port);
-    tcp_hdr->dest   = htons(80);
-    tcp_hdr->seq     = fl->value.ack;
-    tcp_hdr->ack_seq     = htonl(ntohl(fl->value.seq)+100);
-    tcp_hdr->doff     = tcp_len >> 2;
-    tcp_hdr->ack   = 1;
+    tcp_hdr->source     = (fl->port);
+    tcp_hdr->dest       = htons(80);
+    tcp_hdr->seq        = fl->value.ack;
+    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq)+100);
+    tcp_hdr->doff       = tcp_len >> 2;
+    tcp_hdr->ack        = 1;
     if (len != 0) {
         tcp_hdr->psh = 1; // |= TH_PUSH; //0x18; //PSH + ACK
     }
@@ -322,6 +322,8 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
 void send_acks(struct flow *fl)
 {
     struct config *conf = fl->value.conf;
+    char data[100];
+    memset(data, 'A', sizeof(data));
 
     if (conf->saddr == 0) {
         struct sockaddr_in sin;
@@ -334,7 +336,12 @@ void send_acks(struct flow *fl)
     }
 
     int r = tcp_forge_xmit(fl, NULL, 0, conf->saddr, conf->raw_sock);
-    log_debug("send_acks", "%d", r);
+    log_debug("ackhole", "sent empty ack: %d", r);
+
+    //fl->value.ack = htonl(ntohl(fl->value.ack) + 100);
+    // send a data packet while we're at it
+
+    r = tcp_forge_xmit(fl, data, sizeof(data), conf->saddr, conf->raw_sock);
 
     fl->value.sent_acks = 1;
 }
