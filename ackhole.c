@@ -214,7 +214,7 @@ uint16_t tcp_csum(struct iphdr *ip_hdr)
     sum += tcp_size;
     //printf ("init csum: %x, tcp size: %d\n", sum, tcp_size);
 
-    tcph->th_sum = 0x0000;
+    tcph->check = 0x0000;
 
     if (tcp_size%2) { //odd tcp_size,
         sum += (((char*)tcph)[tcp_size-1] << 8);
