@@ -282,18 +282,18 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     ip_hdr->daddr       = (fl->ip);
 
     //fill in tcp header
-    tcp_hdr->th_sport   = (fl->port);
-    tcp_hdr->th_dport   = htons(80);
-    tcp_hdr->th_seq     = fl->value.ack;
-    tcp_hdr->th_ack     = htonl(ntohl(fl->value.seq)+100);
-    tcp_hdr->th_off     = tcp_len >> 2;
-    tcp_hdr->th_flags   = TH_ACK;
+    tcp_hdr->source   = (fl->port);
+    tcp_hdr->dest   = htons(80);
+    tcp_hdr->seq     = fl->value.ack;
+    tcp_hdr->ack_seq     = htonl(ntohl(fl->value.seq)+100);
+    tcp_hdr->doff     = tcp_len >> 2;
+    tcp_hdr->ack   = 1;
     if (len != 0) {
-        tcp_hdr->th_flags |= TH_PUSH; //0x18; //PSH + ACK
+        tcp_hdr->psh = 1; // |= TH_PUSH; //0x18; //PSH + ACK
     }
-    tcp_hdr->th_win     = htons(1024);
+    tcp_hdr->window     = htons(1024);
 
-    tcp_hdr->th_sum = htons(tcp_csum(ip_hdr));
+    tcp_hdr->check = htons(tcp_csum(ip_hdr));
     ip_hdr->check = htons(csum((uint16_t*)ip_hdr, sizeof(struct iphdr)/2, 0));
 
     res = sendto(raw_sock, ip_hdr, tot_len, 0, (struct sockaddr*)&sin, sizeof(sin));
@@ -387,7 +387,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
     inet_ntop(AF_INET, &ip_ptr->saddr, src_ip, 16);
     inet_ntop(AF_INET, &ip_ptr->daddr, dst_ip, 16);
     log_debug("ackhole", "%s:%d -> %s:%d, %d bytes, flags SYN[%d] ACK[%d] PSH[%d] diff %d ms (win %d)",
-            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr.caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->th_win));
+            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr.caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->window));
 
 
     uint32_t ip;
