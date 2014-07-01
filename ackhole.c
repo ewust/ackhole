@@ -342,7 +342,7 @@ void send_acks(struct flow *fl)
 void print_flow(struct flow *fl)
 {
     struct config *conf = fl->value.conf;
-    int64_t diff = (fl->value.first_syn_ts.tv_sec - fl->value.first_response_ts.tv_sec)*1000000 + (fl->value.first_syn_ts.tv_usec - fl->value.first_response_ts.tv_usec);
+    int64_t diff = (fl->value.first_response_ts.tv_sec - fl->value.first_syn_ts.tv_sec)*1000000 + (fl->value.first_response_ts.tv_usec - fl->value.first_syn_ts.tv_usec);
     char src_ip[16];
     char dst_ip[16];
 
