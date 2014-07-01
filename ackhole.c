@@ -21,6 +21,7 @@
 #include "logger.h"
 
 #define HTTP_REQ "GET / HTTP/1.1\r\nHost: www.example.cn\r\nX-Ignore: LNldcCbWyE\x7f}A|pgkRhtTeUor`qw@IuQ~zOv]mxiZHYDBasnKPJjG\\F_fM[^V{SX\r\n"
+#define TCP_EXPIRE_SECS 300
 
 struct stats_t {
     uint64_t    tot_pkts;
@@ -150,6 +151,89 @@ struct flow *lookup_flow(struct flow_map *conn_map, uint32_t ip, uint16_t port)
 
     return NULL;
 }
+
+void cleanup_flow(struct flow_key *key, struct flow_key *prev_key, struct config *conf)
+{
+    struct flow *cur_flow = key->cur;   // this is just fl
+    int idx = HASH_IDX(cur_flow->ip, cur_flow->port);
+
+    log_debug("ackhole", "cleaning up flow %08x:%04x\n", key->cur->ip, key->cur->port);
+
+    // Find previous element in hashtable
+    struct flow *prev_bucket = NULL;
+    struct flow *cur_bucket = conf->conn_map.map[idx];
+    assert(cur_bucket != NULL);
+    while (cur_bucket != NULL && cur_bucket != cur_flow) {
+        prev_bucket = cur_bucket;
+        cur_bucket = cur_bucket->next;
+    }
+    assert(cur_bucket == cur_flow);
+
+    // Fixup map linked list
+    if (prev_bucket != NULL) {
+        prev_bucket->next = cur_flow->next;
+    } else {
+        // First element in list
+        conf->conn_map.map[idx] = cur_flow->next;
+    }
+
+    // Close bev
+    if (cur_flow->value.bev != NULL) {
+        bufferevent_free(cur_flow->value.bev);
+    }
+
+    // Remove from keys list
+    if (prev_key != NULL) {
+        prev_key->next = key->next;
+    } else {
+        // First key in list, set head of list
+        conf->conn_map.keys = key->next;
+    }
+    // Free key entry
+    free(key);
+
+    // Free self
+    free(cur_flow);
+
+    //conf->stats.cur_flows--;
+    conf->current_running--;
+    conf->stats.tot_flows++;
+}
+
+int cleanup_expired(struct config *conf)
+{
+    struct flow_key *cur_key = conf->conn_map.keys;
+    struct timeval cur_ts;
+    struct flow_key *prev_key = NULL;
+    int num_removed = 0;
+
+    // TODO: use packet time or is real time good enough?
+    // possible easy fix: pad TCP_EXPIRE_SEC with the max processing delay we expect
+    gettimeofday(&cur_ts, NULL);
+
+    while (cur_key != NULL) {
+        assert(cur_key->cur != NULL);
+        if (cur_key->cur->value.state == STATE_ACK_RESPONSE ||
+            (cur_key->cur->value.state != STATE_CONNECTING &&
+             (cur_key->cur->value.expire.tv_sec < cur_ts.tv_sec ||
+              (cur_key->cur->value.expire.tv_sec == cur_ts.tv_sec &&
+              cur_key->cur->value.expire.tv_usec <= cur_ts.tv_usec)))) {
+            // Expired
+            struct flow_key *tmp_key = cur_key->next;   // because cleanup_flow will free(cur_key)
+            cleanup_flow(cur_key, prev_key, conf);
+            cur_key = tmp_key;  // Don't update prev_key
+
+            num_removed++;
+        } else {
+            prev_key = cur_key;
+            cur_key = cur_key->next;
+        }
+    }
+
+    return num_removed;
+}
+
+
 
 uint16_t tcp_checksum(unsigned short len_tcp,
         uint32_t saddr, uint32_t daddr, struct tcphdr *tcp_pkt)
@@ -458,10 +542,13 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
 
         if (fl->value.connected && fl->value.state == STATE_DATA_ACK && !fl->value.sent_acks) {
             send_acks(fl);
-            return;
         }
 
     }
+
+    // Update flow expire time
+    memcpy(&fl->value.expire, &pkt_hdr.ts, sizeof(struct timeval));
+    fl->value.expire.tv_sec += TCP_EXPIRE_SECS;
 
     conf->stats.tot_pkts++;
 }
@@ -470,7 +557,9 @@ void print_status(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
 
-    log_info("ackhole", "%d/%d flows %lu pkts", conf->current_running, conf->max_concurrent, conf->stats.tot_pkts);
+    int num_removed = cleanup_expired(conf);
+
+    log_info("ackhole", "%d/%d flows (cleaned up %d) %lu pkts", conf->current_running, conf->max_concurrent, num_removed, conf->stats.tot_pkts);
 
 }
 
