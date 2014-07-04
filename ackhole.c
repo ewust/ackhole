@@ -23,6 +23,9 @@
 #define HTTP_REQ "GET / HTTP/1.1\r\nHost: www.example.cn\r\nX-Ignore: LNldcCbWyE\x7f}A|pgkRhtTeUor`qw@IuQ~zOv]mxiZHYDBasnKPJjG\\F_fM[^V{SX\r\n"
 #define TCP_EXPIRE_SECS 300
 
+
+void stdin_readcb(struct bufferevent *bev, void *arg);
+
 struct stats_t {
     uint64_t    tot_pkts;
     uint32_t    tot_flows;
@@ -93,6 +96,7 @@ struct config {
     struct flow_map conn_map;
 
     struct event *status_ev;
+    struct event *flush_ev;
     struct event *pcap_ev;
     struct bufferevent *stdin_bev;
 
@@ -197,6 +201,11 @@ void cleanup_flow(struct flow_key *key, struct flow_key *prev_key, struct config
 
     //conf->stats.cur_flows--;
     conf->current_running--;
+
+    if (evbuffer_get_length(bufferevent_get_input(conf->stdin_bev)) > 0) {
+        stdin_readcb(conf->stdin_bev, conf);
+    }
+
     conf->stats.tot_flows++;
 }
 
@@ -440,16 +449,27 @@ void print_flow(struct flow *fl)
     inet_ntop(AF_INET, &conf->saddr, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &fl->ip, dst_ip, sizeof(dst_ip));
 
-    log_info("flow_resp", "%s:%d - %s:%d   %d ms", src_ip, ntohs(fl->port), dst_ip, 80, diff/1000);
+    fprintf(stderr, "### %s:%d - %s:%d   %ld ms\n", src_ip, ntohs(fl->port), dst_ip, 80, diff/1000);
 
 }
+
+void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pkt);
 
 void pcap_cb(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
-    const unsigned char *pkt;
-    struct pcap_pkthdr pkt_hdr;
-    struct pcap_pkthdr *pkt_hdr_p;
+
+    log_trace("pcap_cb", "(%d, %02x, %p)", fd, what, ptr);
+
+    int r = pcap_dispatch(conf->pcap, 10000, handle_pkt, (void*)conf);
+    if (r < 0) {
+        log_error("pcap_cb", "pcap_dispatch returned -1: %s", pcap_geterr(conf->pcap));
+    }
+}
+
+void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pkt)
+{
+    struct config *conf = (struct config *)ptr;
     char src_ip[16];
     char dst_ip[16];
     struct timeval tv;
@@ -457,17 +477,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
 
     gettimeofday(&tv, NULL);
 
-
-    log_trace("pcap_cb", "(%d, %02x, %p)", fd, what, ptr);
-
-    //pkt = pcap_next(conf->pcap, &pkt_hdr);
-    pcap_next_ex(conf->pcap, &pkt_hdr_p, &pkt);
-    if (pkt == NULL) {
-        return;
-    }
-    memcpy(&pkt_hdr, pkt_hdr_p, sizeof(pkt_hdr));
-
-    diff = (tv.tv_sec - pkt_hdr.ts.tv_sec)*1000000 + (tv.tv_usec - pkt_hdr.ts.tv_usec);
+    diff = (tv.tv_sec - pkt_hdr->ts.tv_sec)*1000000 + (tv.tv_usec - pkt_hdr->ts.tv_usec);
 
     struct iphdr *ip_ptr = (struct iphdr *)(pkt + sizeof(struct ether_header));
     if (ip_ptr->protocol != IPPROTO_TCP) {
@@ -478,7 +488,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
     inet_ntop(AF_INET, &ip_ptr->saddr, src_ip, 16);
     inet_ntop(AF_INET, &ip_ptr->daddr, dst_ip, 16);
     log_debug("ackhole", "%s:%d -> %s:%d, %d bytes, flags SYN[%d] ACK[%d] PSH[%d] diff %d ms (win %d)",
-            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr.caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->window));
+            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr->caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->window));
 
 
     uint32_t ip;
@@ -505,7 +515,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
         if (fl->value.state == STATE_CONNECTING && th->syn) {
             log_trace("ackhole", " -> STATE_SYN_SENT");
             fl->value.state = STATE_SYN_SENT;
-            memcpy(&fl->value.first_syn_ts, &pkt_hdr.ts, sizeof(struct timeval));
+            memcpy(&fl->value.first_syn_ts, &pkt_hdr->ts, sizeof(struct timeval));
         } else if (fl->value.state == STATE_SYN_RECV && th->psh) {  // Does not support fragments of HTTP_REQ
             fl->value.state = STATE_DATA_SENT;
             fl->value.waiting_ack = htonl(ntohl(th->seq) + strlen(HTTP_REQ));
@@ -535,7 +545,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
             fl->value.state = STATE_DATA_ACK; // now we can send acks
         } else if (fl->value.state == STATE_DATA_ACK && fl->value.sent_acks) {
             // Dun dun. the server has responded with data.
-            memcpy(&fl->value.first_response_ts, &pkt_hdr.ts, sizeof(struct timeval));
+            memcpy(&fl->value.first_response_ts, &pkt_hdr->ts, sizeof(struct timeval));
             fl->value.state = STATE_ACK_RESPONSE;
             print_flow(fl);
         }
@@ -547,7 +557,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
     }
 
     // Update flow expire time
-    memcpy(&fl->value.expire, &pkt_hdr.ts, sizeof(struct timeval));
+    memcpy(&fl->value.expire, &pkt_hdr->ts, sizeof(struct timeval));
     fl->value.expire.tv_sec += TCP_EXPIRE_SECS;
 
     conf->stats.tot_pkts++;
@@ -560,6 +570,8 @@ void print_status(evutil_socket_t fd, short what, void *ptr)
     int num_removed = cleanup_expired(conf);
 
     log_info("ackhole", "%d/%d flows (cleaned up %d) %d flows (%lu pkts)", conf->current_running, conf->max_concurrent, num_removed, conf->stats.tot_flows, conf->stats.tot_pkts);
+
+    pcap_cb(0, 0, conf);
 
 }
 
@@ -614,6 +626,7 @@ void make_conn(struct flow *fl)
         perror("socket");
         return;
     }
+    evutil_make_socket_nonblocking(fl->value.sock);
     if (bind(fl->value.sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
         perror("bind");
         // TODO: cleanup
@@ -800,6 +813,10 @@ int main(int argc,char **argv)
 
     if (pcap_fname == NULL) {
         conf.pcap_fd = pcap_fileno(conf.pcap);
+        if (pcap_setnonblock(conf.pcap, 1, errbuf)) {
+            log_error("ackhole", "setnonblock failed: %s", errbuf);
+            return -1;
+        }
     } else {
         conf.pcap_fd = fileno(pcap_fstream);
     }
@@ -813,6 +830,11 @@ int main(int argc,char **argv)
     // Event on pcap fd EV_READ
     conf.pcap_ev = event_new(conf.base, conf.pcap_fd, EV_READ|EV_PERSIST, pcap_cb, &conf);
     event_add(conf.pcap_ev, NULL);
+
+    // pcap dispatch timer
+    struct timeval pc_ts = {0, 1000*100};   // 100ms
+    conf.flush_ev = event_new(conf.base, -1, EV_PERSIST, pcap_cb, &conf);
+    event_add(conf.flush_ev, &pc_ts);
 
     // Status timer
     struct timeval one_sec = {1, 0};
