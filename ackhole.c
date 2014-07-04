@@ -156,12 +156,21 @@ struct flow *lookup_flow(struct flow_map *conn_map, uint32_t ip, uint16_t port)
     return NULL;
 }
 
+void print_flow(struct flow *fl);
+
 void cleanup_flow(struct flow_key *key, struct flow_key *prev_key, struct config *conf)
 {
     struct flow *cur_flow = key->cur;   // this is just fl
     int idx = HASH_IDX(cur_flow->ip, cur_flow->port);
 
     log_debug("ackhole", "cleaning up flow %08x:%04x\n", key->cur->ip, key->cur->port);
+    if (cur_flow->value.state == STATE_DATA_ACK && cur_flow->value.sent_acks) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        memcpy(&cur_flow->value.first_response_ts, &tv, sizeof(struct timeval));
+        cur_flow->value.state = STATE_ACK_RESPONSE;
+        print_flow(cur_flow);
+    }
 
     // Find previous element in hashtable
     struct flow *prev_bucket = NULL;
@@ -812,11 +821,11 @@ int main(int argc,char **argv)
     }
 
     if (pcap_fname == NULL) {
-        conf.pcap_fd = pcap_fileno(conf.pcap);
         if (pcap_setnonblock(conf.pcap, 1, errbuf)) {
             log_error("ackhole", "setnonblock failed: %s", errbuf);
             return -1;
         }
+        conf.pcap_fd = pcap_fileno(conf.pcap);
     } else {
         conf.pcap_fd = fileno(pcap_fstream);
     }
