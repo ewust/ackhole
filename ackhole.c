@@ -43,7 +43,7 @@ struct flow_t {
     uint32_t num_recv;
 
     // These are for our pcap state machine; as we receive packets we go through these phases
-    enum {STATE_CONNECTING, STATE_SYN_SENT, STATE_SYN_RECV, STATE_DATA_SENT, STATE_DATA_ACK, STATE_ACK_RESPONSE} state;
+    enum {STATE_CONNECTING, STATE_SYN_SENT, STATE_SYN_RECV, STATE_DATA_SENT, STATE_DATA_ACK, STATE_ACK_RESPONSE, STATE_CLEANUP} state;
 
     int connected;
     int sent_acks;
@@ -239,7 +239,8 @@ int cleanup_expired(struct config *conf)
 
     while (cur_key != NULL) {
         assert(cur_key->cur != NULL);
-        if (cur_key->cur->value.state == STATE_ACK_RESPONSE ||
+        if (cur_key->cur->value.state == STATE_CLEANUP ||
+            cur_key->cur->value.state == STATE_ACK_RESPONSE ||
             (cur_key->cur->value.state != STATE_CONNECTING &&
              (cur_key->cur->value.expire.tv_sec < cur_ts.tv_sec ||
               (cur_key->cur->value.expire.tv_sec == cur_ts.tv_sec &&
@@ -432,6 +433,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
 void send_acks(struct flow *fl)
 {
     struct config *conf = fl->value.conf;
+    /*
     char data[100];
     memset(data, 'A', sizeof(data));
 
@@ -452,6 +454,7 @@ void send_acks(struct flow *fl)
     // send a data packet while we're at it
 
     r = tcp_forge_xmit(fl, data, sizeof(data), conf->saddr, conf->raw_sock);
+    */
 
     fl->value.sent_acks = 1;
 }
@@ -533,6 +536,10 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
             log_trace("ackhole", " -> STATE_SYN_SENT");
             fl->value.state = STATE_SYN_SENT;
             memcpy(&fl->value.first_syn_ts, &pkt_hdr->ts, sizeof(struct timeval));
+
+            // Update flow expire time
+            memcpy(&fl->value.expire, &pkt_hdr->ts, sizeof(struct timeval));
+            fl->value.expire.tv_sec += TCP_EXPIRE_SECS;
         } else if (fl->value.state == STATE_SYN_RECV && th->psh) {  // Does not support fragments of HTTP_REQ
             fl->value.state = STATE_DATA_SENT;
             fl->value.waiting_ack = htonl(ntohl(th->seq) + strlen(HTTP_REQ));
@@ -573,9 +580,6 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
 
     }
 
-    // Update flow expire time
-    memcpy(&fl->value.expire, &pkt_hdr->ts, sizeof(struct timeval));
-    fl->value.expire.tv_sec += TCP_EXPIRE_SECS;
 
     conf->stats.tot_pkts++;
 }
@@ -609,6 +613,12 @@ void stdin_eventcb(struct bufferevent *bev, short events, void *ptr) {
     }
 }
 
+void mark_flow_for_cleanup(struct flow *fl)
+{
+    fl->value.state = STATE_CLEANUP;
+
+}
+
 void conn_eventcb(struct bufferevent *bev, short events, void *ptr)
 {
     struct flow *fl = ptr;
@@ -620,8 +630,11 @@ void conn_eventcb(struct bufferevent *bev, short events, void *ptr)
         fl->value.connected = 1;
     } else if (events & BEV_EVENT_ERROR) {
          /* An error occured while connecting. */
+        //cleanup_flow
+        mark_flow_for_cleanup(fl);
     } else {
         // TODO: close
+        mark_flow_for_cleanup(fl);
     }
 }
 
@@ -634,7 +647,7 @@ void make_conn(struct flow *fl)
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = inet_addr("0.0.0.0");
+    sin.sin_addr.s_addr = inet_addr("141.212.121.224");
     sin.sin_port = htons(0);
 
     // Bind and get our source port for the conn_map
