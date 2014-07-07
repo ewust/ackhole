@@ -157,6 +157,7 @@ struct flow *lookup_flow(struct flow_map *conn_map, uint32_t ip, uint16_t port)
 }
 
 void print_flow(struct flow *fl);
+void print_status(evutil_socket_t fd, short what, void *ptr);
 
 void cleanup_flow(struct flow_key *key, struct flow_key *prev_key, struct config *conf)
 {
@@ -213,6 +214,13 @@ void cleanup_flow(struct flow_key *key, struct flow_key *prev_key, struct config
 
     if (evbuffer_get_length(bufferevent_get_input(conf->stdin_bev)) > 0) {
         stdin_readcb(conf->stdin_bev, conf);
+    }
+
+    if (conf->stdin_closed && conf->current_running == 0) {
+        // Done
+        log_info("banner-grab-tcp", "done");
+        print_status(0, 0, conf);
+        exit(0);
     }
 
     conf->stats.tot_flows++;
