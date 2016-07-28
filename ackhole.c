@@ -22,7 +22,7 @@
 
 #define HTTP_REQ "GET / HTTP/1.1\r\nHost: www.example.cn\r\nX-Ignore: LNldcCbWyE\x7f}A|pgkRhtTeUor`qw@IuQ~zOv]mxiZHYDBasnKPJjG\\F_fM[^V{SX\r\n"
 #define TCP_EXPIRE_SECS 30
-
+#define TCP_PORT 80
 
 void stdin_readcb(struct bufferevent *bev, void *arg);
 
@@ -41,6 +41,9 @@ struct flow_t {
     uint32_t seq;
     uint32_t ack;
     uint32_t num_recv;
+
+    uint32_t ts_val;
+    uint32_t ts_ecr;
 
     // These are for our pcap state machine; as we receive packets we go through these phases
     enum {STATE_CONNECTING, STATE_SYN_SENT, STATE_SYN_RECV, STATE_DATA_SENT, STATE_DATA_ACK, STATE_ACK_RESPONSE, STATE_CLEANUP} state;
@@ -339,7 +342,16 @@ uint16_t tcp_csum(struct iphdr *ip_hdr)
 //maybe place reasonable constraint on len (<= 10000, jumbo frames?)
 int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int raw_sock)
 {
-    int tcp_len = sizeof(struct tcphdr);
+
+    // options: 01 01 080a06bbe49ec7e58335
+    uint8_t options[] = {0x01, 0x01, 0x08, 0x0a, 0x06, 0xbb, 0xe4, 0x9e, 0xc7, 0xe5, 0x83, 0x35};
+    uint32_t ts_val = htonl(fl->value.ts_ecr + 1);
+    uint32_t ts_ecr = htonl(fl->value.ts_val);
+    memcpy(options+4, &ts_val, 4);
+    memcpy(options+8, &ts_ecr, 4);
+    //uint8_t options[] = {};
+
+    int tcp_len = sizeof(struct tcphdr) + sizeof(options);
 
     char *forge_again = NULL;
     int forge_again_len = 0;
@@ -351,6 +363,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
         len = 1448;
     }
 
+
     int tot_len = len + tcp_len + sizeof(struct iphdr);
     struct iphdr *ip_hdr;
     struct tcphdr *tcp_hdr;
@@ -360,7 +373,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     
     //set up sin destination
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(80);
+    sin.sin_port = htons(TCP_PORT);
     sin.sin_addr.s_addr = fl->ip;
    
     
@@ -394,7 +407,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
 
     //fill in tcp header
     tcp_hdr->source     = (fl->port);
-    tcp_hdr->dest       = htons(80);
+    tcp_hdr->dest       = htons(TCP_PORT);
     tcp_hdr->seq        = fl->value.ack;
     tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq)+100);
     tcp_hdr->doff       = tcp_len >> 2;
@@ -403,6 +416,10 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
         tcp_hdr->psh = 1; // |= TH_PUSH; //0x18; //PSH + ACK
     }
     tcp_hdr->window     = htons(1024);
+
+    memcpy((tcp_hdr+1), options, sizeof(options));
+
+
 
     tcp_hdr->check = htons(tcp_csum(ip_hdr));
     ip_hdr->check = htons(csum((uint16_t*)ip_hdr, sizeof(struct iphdr)/2, 0));
@@ -468,7 +485,7 @@ void print_flow(struct flow *fl)
     inet_ntop(AF_INET, &conf->saddr, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &fl->ip, dst_ip, sizeof(dst_ip));
 
-    fprintf(stderr, "### %s:%d - %s:%d   %ld ms\n", src_ip, ntohs(fl->port), dst_ip, 80, diff/1000);
+    fprintf(stderr, "### %s:%d - %s:%d   %ld ms\n", src_ip, ntohs(fl->port), dst_ip, TCP_PORT, diff/1000);
 
 }
 
@@ -515,7 +532,7 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
     struct flow *fl;
 
 
-    if (ntohs(th->source) != 80) {
+    if (ntohs(th->source) != TCP_PORT) {
         // client -> server
         ip = ip_ptr->daddr;
         port = th->source;
@@ -565,6 +582,13 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
             fl->value.state = STATE_SYN_RECV;
         } else if (fl->value.state == STATE_DATA_SENT && th->ack && th->ack_seq == fl->value.waiting_ack) {
             log_trace("ackhole", " -> STATE_DATA_ACK");
+            // grab tcp options
+            uint32_t ts_val, ts_ecr;
+            memcpy(&ts_val, ((uint8_t*)(th+1))+4, 4);
+            memcpy(&ts_ecr, ((uint8_t*)(th+1))+8, 4);
+            fl->value.ts_val = ntohl(ts_val);
+            fl->value.ts_ecr = ntohl(ts_ecr);
+
             fl->value.state = STATE_DATA_ACK; // now we can send acks
         } else if (fl->value.state == STATE_DATA_ACK && fl->value.sent_acks) {
             // Dun dun. the server has responded with data.
@@ -646,7 +670,7 @@ void make_conn(struct flow *fl)
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = inet_addr("128.138.200.213");
+    sin.sin_addr.s_addr = inet_addr("128.138.200.81");
     sin.sin_port = htons(0);
 
     // Bind and get our source port for the conn_map
@@ -676,7 +700,7 @@ void make_conn(struct flow *fl)
 
     // Connect to this socket
     sin.sin_addr.s_addr = fl->ip;
-    sin.sin_port = htons(80);
+    sin.sin_port = htons(TCP_PORT);
 
     fl->value.bev = bufferevent_socket_new(conf->base, fl->value.sock, BEV_OPT_CLOSE_ON_FREE);
     if (!fl->value.bev) {
