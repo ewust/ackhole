@@ -21,7 +21,7 @@
 #include "logger.h"
 
 #define HTTP_REQ "GET / HTTP/1.1\r\nHost: www.example.cn\r\nX-Ignore: LNldcCbWyE\x7f}A|pgkRhtTeUor`qw@IuQ~zOv]mxiZHYDBasnKPJjG\\F_fM[^V{SX\r\n"
-#define TCP_EXPIRE_SECS 300
+#define TCP_EXPIRE_SECS 30
 
 
 void stdin_readcb(struct bufferevent *bev, void *arg);
@@ -433,7 +433,6 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
 void send_acks(struct flow *fl)
 {
     struct config *conf = fl->value.conf;
-    /*
     char data[100];
     memset(data, 'A', sizeof(data));
 
@@ -453,8 +452,8 @@ void send_acks(struct flow *fl)
     //fl->value.ack = htonl(ntohl(fl->value.ack) + 100);
     // send a data packet while we're at it
 
-    r = tcp_forge_xmit(fl, data, sizeof(data), conf->saddr, conf->raw_sock);
-    */
+    //r = tcp_forge_xmit(fl, data, sizeof(data), conf->saddr, conf->raw_sock);
+    //*/
 
     fl->value.sent_acks = 1;
 }
@@ -479,7 +478,7 @@ void pcap_cb(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
 
-    log_trace("pcap_cb", "(%d, %02x, %p)", fd, what, ptr);
+    //log_trace("pcap_cb", "(%d, %02x, %p)", fd, what, ptr);
 
     int r = pcap_dispatch(conf->pcap, 10000, handle_pkt, (void*)conf);
     if (r < 0) {
@@ -647,7 +646,7 @@ void make_conn(struct flow *fl)
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = inet_addr("141.212.121.224");
+    sin.sin_addr.s_addr = inet_addr("128.138.200.213");
     sin.sin_port = htons(0);
 
     // Bind and get our source port for the conn_map
@@ -680,11 +679,17 @@ void make_conn(struct flow *fl)
     sin.sin_port = htons(80);
 
     fl->value.bev = bufferevent_socket_new(conf->base, fl->value.sock, BEV_OPT_CLOSE_ON_FREE);
+    if (!fl->value.bev) {
+        log_error("ackhole", "failed to make a bev");
+        return;
+    }
 
     bufferevent_setcb(fl->value.bev, NULL, NULL, conn_eventcb, fl);
 
     if (bufferevent_socket_connect(fl->value.bev,
         (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        perror("connect");
+        log_error("ackhole", "connect fail");
         /* Error starting connection */
         bufferevent_free(fl->value.bev);
         return;
