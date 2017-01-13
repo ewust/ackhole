@@ -354,7 +354,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     // options: 01 01 080a06bbe49ec7e58335
     uint8_t options[] = {0x01, 0x01, 0x08, 0x0a, 0x06, 0xbb, 0xe4, 0x9e, 0xc7, 0xe5, 0x83, 0x35};
     uint32_t ts_val = htonl(fl->value.ts_ecr);
-    uint32_t ts_ecr = htonl(fl->value.ts_val - 30);
+    uint32_t ts_ecr = htonl(fl->value.ts_val);
     memcpy(options+4, &ts_val, 4);
     memcpy(options+8, &ts_ecr, 4);
     //uint8_t options[] = {};
@@ -417,11 +417,14 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     tcp_hdr->source     = (fl->port);
     tcp_hdr->dest       = htons(TCP_PORT);
     tcp_hdr->seq        = fl->value.ack;
-    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq)+200);
+    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq));
     tcp_hdr->doff       = tcp_len >> 2;
-    tcp_hdr->ack        = 1;
-    if (len != 0) {
-        tcp_hdr->psh = 1; // |= TH_PUSH; //0x18; //PSH + ACK
+    if (len == 0) {
+        tcp_hdr->ack_seq    = 0;
+        tcp_hdr->rst        = 1;
+    } else {
+        tcp_hdr->ack        = 1;
+        tcp_hdr->psh        = 1; // |= TH_PUSH; //0x18; //PSH + ACK
     }
     tcp_hdr->window     = htons(1024);
 
@@ -452,9 +455,17 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     return res;
 }
 
+void send_data(evutil_socket_t fd, short what, void *ptr)
+{
+    struct flow *fl = ptr;
 
+    log_trace("ackhole", "sending data");
+    // Send some data after our RST to see what happens
+    bufferevent_write(fl->value.ssl_bev, HTTP_REQ, strlen(HTTP_REQ));
+}
 
-
+// This is where we send ACKs or RSTs or whatever in an attempt
+// to disrupt the server and get it to respond.
 void send_acks(struct flow *fl)
 {
     struct config *conf = fl->value.conf;
@@ -479,6 +490,11 @@ void send_acks(struct flow *fl)
 
     //r = tcp_forge_xmit(fl, data, sizeof(data), conf->saddr, conf->raw_sock);
     //*/
+
+
+    struct timeval data_timeout = {61, 0};
+    struct event *ev = event_new(conf->base, -1, 0, send_data, fl);
+    event_add(ev, &data_timeout);
 
     fl->value.sent_acks = 1;
 }
@@ -625,6 +641,7 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
             fl->value.state = STATE_DATA_ACK; // now we can send acks or RSTs or whatever
         } else if (fl->value.state == STATE_DATA_ACK && fl->value.sent_acks) {
             // Dun dun. the server has responded with data.
+            log_trace("ackhole", "server didn't shut up");
             memcpy(&fl->value.first_response_ts, &pkt_hdr->ts, sizeof(struct timeval));
             fl->value.state = STATE_ACK_RESPONSE;
             print_flow(fl);
