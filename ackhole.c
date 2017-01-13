@@ -345,8 +345,8 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
 
     // options: 01 01 080a06bbe49ec7e58335
     uint8_t options[] = {0x01, 0x01, 0x08, 0x0a, 0x06, 0xbb, 0xe4, 0x9e, 0xc7, 0xe5, 0x83, 0x35};
-    uint32_t ts_val = htonl(fl->value.ts_ecr + 1);
-    uint32_t ts_ecr = htonl(fl->value.ts_val);
+    uint32_t ts_val = htonl(fl->value.ts_ecr);
+    uint32_t ts_ecr = htonl(fl->value.ts_val - 30);
     memcpy(options+4, &ts_val, 4);
     memcpy(options+8, &ts_ecr, 4);
     //uint8_t options[] = {};
@@ -409,7 +409,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     tcp_hdr->source     = (fl->port);
     tcp_hdr->dest       = htons(TCP_PORT);
     tcp_hdr->seq        = fl->value.ack;
-    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq)+100);
+    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq)+200);
     tcp_hdr->doff       = tcp_len >> 2;
     tcp_hdr->ack        = 1;
     if (len != 0) {
@@ -611,7 +611,8 @@ void print_status(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
 
-    int num_removed = cleanup_expired(conf);
+    //int num_removed = cleanup_expired(conf);
+    int num_removed = 0;
 
     log_info("ackhole", "%d/%d flows (cleaned up %d) %d flows (%lu pkts)", conf->current_running, conf->max_concurrent, num_removed, conf->stats.tot_flows, conf->stats.tot_pkts);
 
@@ -670,7 +671,7 @@ void make_conn(struct flow *fl)
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = inet_addr("128.138.200.81");
+    sin.sin_addr.s_addr = inet_addr("0.0.0.0");
     sin.sin_port = htons(0);
 
     // Bind and get our source port for the conn_map
