@@ -1,7 +1,7 @@
 
 
 CFLAGS+=-g
-LDFLAGS+=-lpcap -levent -lm
+LDFLAGS+=-lpcap -levent -levent_extra -levent_openssl -lssl -lm
 
 all: ackhole
 
