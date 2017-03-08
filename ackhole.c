@@ -420,8 +420,9 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq));
     tcp_hdr->doff       = tcp_len >> 2;
     if (len == 0) {
-        tcp_hdr->ack_seq    = 0;
-        tcp_hdr->rst        = 1;
+        //tcp_hdr->ack_seq    = 0;
+        //tcp_hdr->rst        = 1;
+        tcp_hdr->ack        = 1;
     } else {
         tcp_hdr->ack        = 1;
         tcp_hdr->psh        = 1; // |= TH_PUSH; //0x18; //PSH + ACK
@@ -492,9 +493,11 @@ void send_acks(struct flow *fl)
     //*/
 
 
-    struct timeval data_timeout = {61, 0};
+    /*
+    struct timeval data_timeout = {1, 0};
     struct event *ev = event_new(conf->base, -1, 0, send_data, fl);
     event_add(ev, &data_timeout);
+    */
 
     fl->value.sent_acks = 1;
 }
