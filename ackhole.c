@@ -13,16 +13,18 @@
 #include <event2/event.h>
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
+#include <event2/bufferevent_ssl.h>
 #include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <openssl/ssl.h>
 
 #include "logger.h"
 
 #define HTTP_REQ "GET / HTTP/1.1\r\nHost: www.example.cn\r\nX-Ignore: LNldcCbWyE\x7f}A|pgkRhtTeUor`qw@IuQ~zOv]mxiZHYDBasnKPJjG\\F_fM[^V{SX\r\n"
 #define TCP_EXPIRE_SECS 30
-
+#define TCP_PORT 443
 
 void stdin_readcb(struct bufferevent *bev, void *arg);
 
@@ -37,15 +39,23 @@ struct flow_t {
 
     int sock;
     struct bufferevent *bev;
+    struct bufferevent *ssl_bev;
+    SSL *ssl;
 
     uint32_t seq;
     uint32_t ack;
     uint32_t num_recv;
 
+    uint32_t ts_val;
+    uint32_t ts_ecr;
+
     // These are for our pcap state machine; as we receive packets we go through these phases
-    enum {STATE_CONNECTING, STATE_SYN_SENT, STATE_SYN_RECV, STATE_DATA_SENT, STATE_DATA_ACK, STATE_ACK_RESPONSE, STATE_CLEANUP} state;
+    enum {STATE_CONNECTING, STATE_SYN_SENT, STATE_SYN_RECV, STATE_CLIENT_HELLO_SENT,
+        STATE_CERT_RECVING, STATE_CLIENT_KEYX_SENT, STATE_FINISHED_RECVING, STATE_DATA_SENT,
+        STATE_DATA_ACK, STATE_ACK_RESPONSE, STATE_CLEANUP} state;
 
     int connected;
+    int ssl_connected;
     int sent_acks;
 
     // The ack (from server) before we can actually send ACKS. This ACKs our incomplete HTTP_REQ
@@ -89,6 +99,7 @@ struct config {
     int      pcap_fd;
     struct event_base *base;
     uint32_t saddr;
+    SSL_CTX *ssl_ctx;
 
     int current_running;
     int max_concurrent;
@@ -339,7 +350,16 @@ uint16_t tcp_csum(struct iphdr *ip_hdr)
 //maybe place reasonable constraint on len (<= 10000, jumbo frames?)
 int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int raw_sock)
 {
-    int tcp_len = sizeof(struct tcphdr);
+
+    // options: 01 01 080a06bbe49ec7e58335
+    uint8_t options[] = {0x01, 0x01, 0x08, 0x0a, 0x06, 0xbb, 0xe4, 0x9e, 0xc7, 0xe5, 0x83, 0x35};
+    uint32_t ts_val = htonl(fl->value.ts_ecr);
+    uint32_t ts_ecr = htonl(fl->value.ts_val);
+    memcpy(options+4, &ts_val, 4);
+    memcpy(options+8, &ts_ecr, 4);
+    //uint8_t options[] = {};
+
+    int tcp_len = sizeof(struct tcphdr) + sizeof(options);
 
     char *forge_again = NULL;
     int forge_again_len = 0;
@@ -351,6 +371,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
         len = 1448;
     }
 
+
     int tot_len = len + tcp_len + sizeof(struct iphdr);
     struct iphdr *ip_hdr;
     struct tcphdr *tcp_hdr;
@@ -360,7 +381,7 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     
     //set up sin destination
     sin.sin_family = AF_INET;
-    sin.sin_port = htons(80);
+    sin.sin_port = htons(TCP_PORT);
     sin.sin_addr.s_addr = fl->ip;
    
     
@@ -394,15 +415,23 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
 
     //fill in tcp header
     tcp_hdr->source     = (fl->port);
-    tcp_hdr->dest       = htons(80);
+    tcp_hdr->dest       = htons(TCP_PORT);
     tcp_hdr->seq        = fl->value.ack;
-    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq)+100);
+    tcp_hdr->ack_seq    = htonl(ntohl(fl->value.seq));
     tcp_hdr->doff       = tcp_len >> 2;
-    tcp_hdr->ack        = 1;
-    if (len != 0) {
-        tcp_hdr->psh = 1; // |= TH_PUSH; //0x18; //PSH + ACK
+    if (len == 0) {
+        //tcp_hdr->ack_seq    = 0;
+        //tcp_hdr->rst        = 1;
+        tcp_hdr->ack        = 1;
+    } else {
+        tcp_hdr->ack        = 1;
+        tcp_hdr->psh        = 1; // |= TH_PUSH; //0x18; //PSH + ACK
     }
     tcp_hdr->window     = htons(1024);
+
+    memcpy((tcp_hdr+1), options, sizeof(options));
+
+
 
     tcp_hdr->check = htons(tcp_csum(ip_hdr));
     ip_hdr->check = htons(csum((uint16_t*)ip_hdr, sizeof(struct iphdr)/2, 0));
@@ -427,9 +456,17 @@ int tcp_forge_xmit(struct flow *fl, char *payload, int len, uint32_t saddr, int 
     return res;
 }
 
+void send_data(evutil_socket_t fd, short what, void *ptr)
+{
+    struct flow *fl = ptr;
 
+    log_trace("ackhole", "sending data");
+    // Send some data after our RST to see what happens
+    bufferevent_write(fl->value.ssl_bev, HTTP_REQ, strlen(HTTP_REQ));
+}
 
-
+// This is where we send ACKs or RSTs or whatever in an attempt
+// to disrupt the server and get it to respond.
 void send_acks(struct flow *fl)
 {
     struct config *conf = fl->value.conf;
@@ -455,6 +492,13 @@ void send_acks(struct flow *fl)
     //r = tcp_forge_xmit(fl, data, sizeof(data), conf->saddr, conf->raw_sock);
     //*/
 
+
+    /*
+    struct timeval data_timeout = {1, 0};
+    struct event *ev = event_new(conf->base, -1, 0, send_data, fl);
+    event_add(ev, &data_timeout);
+    */
+
     fl->value.sent_acks = 1;
 }
 
@@ -468,7 +512,7 @@ void print_flow(struct flow *fl)
     inet_ntop(AF_INET, &conf->saddr, src_ip, sizeof(src_ip));
     inet_ntop(AF_INET, &fl->ip, dst_ip, sizeof(dst_ip));
 
-    fprintf(stderr, "### %s:%d - %s:%d   %ld ms\n", src_ip, ntohs(fl->port), dst_ip, 80, diff/1000);
+    fprintf(stderr, "### %s:%d - %s:%d   %ld ms\n", src_ip, ntohs(fl->port), dst_ip, TCP_PORT, diff/1000);
 
 }
 
@@ -506,8 +550,10 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
     struct tcphdr *th = (struct tcphdr*)(pkt + sizeof(struct ether_header) + (4*(ip_ptr->ihl)));
     inet_ntop(AF_INET, &ip_ptr->saddr, src_ip, 16);
     inet_ntop(AF_INET, &ip_ptr->daddr, dst_ip, 16);
-    log_debug("ackhole", "%s:%d -> %s:%d, %d bytes, flags SYN[%d] ACK[%d] PSH[%d] diff %d ms (win %d)",
-            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr->caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->window));
+    uint16_t data_len = ntohs(ip_ptr->tot_len) - (4*(ip_ptr->ihl)) - (4*th->doff);
+
+    log_debug("ackhole", "%s:%d -> %s:%d, %d bytes, flags SYN[%d] ACK[%d] PSH[%d] diff %d ms (win %d) %d bytes data",
+            src_ip, ntohs(th->source), dst_ip, ntohs(th->dest), pkt_hdr->caplen, th->syn, th->ack, th->psh, diff/1000, ntohs(th->window), data_len);
 
 
     uint32_t ip;
@@ -515,7 +561,7 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
     struct flow *fl;
 
 
-    if (ntohs(th->source) != 80) {
+    if (ntohs(th->source) != TCP_PORT) {
         // client -> server
         ip = ip_ptr->daddr;
         port = th->source;
@@ -540,13 +586,23 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
             memcpy(&fl->value.expire, &pkt_hdr->ts, sizeof(struct timeval));
             fl->value.expire.tv_sec += TCP_EXPIRE_SECS;
         } else if (fl->value.state == STATE_SYN_RECV && th->psh) {  // Does not support fragments of HTTP_REQ
+            fl->value.state = STATE_CLIENT_HELLO_SENT;
+            //fl->value.waiting_ack = htonl(ntohl(th->seq) + strlen(HTTP_REQ));
+            log_trace("ackhole", " -> STATE_CLIENT_HELLO_SENT");
+        } else if (fl->value.state == STATE_CERT_RECVING && th->psh) {
+            fl->value.state = STATE_CLIENT_KEYX_SENT;
+            log_trace("ackhole", " -> STATE_CLIENT_KEYX_SENT");
+        } else if (fl->value.state == STATE_FINISHED_RECVING && th->psh) {
+            // Sent application data
+            // TODO: double check this is an app packet??
             fl->value.state = STATE_DATA_SENT;
-            fl->value.waiting_ack = htonl(ntohl(th->seq) + strlen(HTTP_REQ));
-            log_trace("ackhole", " -> STATE_DATA_SENT (waiting ack %08x", fl->value.waiting_ack);
+            fl->value.waiting_ack = htonl(ntohl(th->seq) + data_len);
+            log_trace("ackhole", " -> STATE_DATA_SENT (waiting ack %08x)", fl->value.waiting_ack);
         }
 
     } else {
 
+        // server -> client
         ip = ip_ptr->saddr;
         port = th->dest;
 
@@ -563,11 +619,32 @@ void handle_pkt(u_char *ptr, const struct pcap_pkthdr *pkt_hdr, const u_char* pk
         if (fl->value.state == STATE_SYN_SENT && th->syn && th->ack) {
             log_trace("ackhole", " -> STATE_SYN_RECV");
             fl->value.state = STATE_SYN_RECV;
+
+        } else if (fl->value.state == STATE_CLIENT_HELLO_SENT && th->ack && data_len > 0) {
+            // This state doesn't mean we received the cert, but that the server has started
+            // sending server hello/cert/server key exchange/server hello done
+            // next state is client sending a key exchange
+            log_trace("ackhole", " -> STATE_CERT_RECVING");
+            fl->value.state = STATE_CERT_RECVING;
+
+        } else if (fl->value.state == STATE_CLIENT_KEYX_SENT && th->ack && data_len > 0) {
+            // Again, server is in process of sending finished message
+            log_trace("ackhole", " -> STATE_FINISHED_RECVING");
+            fl->value.state = STATE_FINISHED_RECVING;
         } else if (fl->value.state == STATE_DATA_SENT && th->ack && th->ack_seq == fl->value.waiting_ack) {
             log_trace("ackhole", " -> STATE_DATA_ACK");
-            fl->value.state = STATE_DATA_ACK; // now we can send acks
+            // grab tcp options
+            // TODO: actually parse options correctly
+            uint32_t ts_val, ts_ecr;
+            memcpy(&ts_val, ((uint8_t*)(th+1))+4, 4);
+            memcpy(&ts_ecr, ((uint8_t*)(th+1))+8, 4);
+            fl->value.ts_val = ntohl(ts_val);
+            fl->value.ts_ecr = ntohl(ts_ecr);
+
+            fl->value.state = STATE_DATA_ACK; // now we can send acks or RSTs or whatever
         } else if (fl->value.state == STATE_DATA_ACK && fl->value.sent_acks) {
             // Dun dun. the server has responded with data.
+            log_trace("ackhole", "server didn't shut up");
             memcpy(&fl->value.first_response_ts, &pkt_hdr->ts, sizeof(struct timeval));
             fl->value.state = STATE_ACK_RESPONSE;
             print_flow(fl);
@@ -587,7 +664,8 @@ void print_status(evutil_socket_t fd, short what, void *ptr)
 {
     struct config *conf = ptr;
 
-    int num_removed = cleanup_expired(conf);
+    //int num_removed = cleanup_expired(conf);
+    int num_removed = 0;
 
     log_info("ackhole", "%d/%d flows (cleaned up %d) %d flows (%lu pkts)", conf->current_running, conf->max_concurrent, num_removed, conf->stats.tot_flows, conf->stats.tot_pkts);
 
@@ -618,6 +696,18 @@ void mark_flow_for_cleanup(struct flow *fl)
 
 }
 
+void ssl_conn_eventcb(struct bufferevent *bev, short events, void *ptr)
+{
+    struct flow *fl = ptr;
+    log_trace("ssl_conn_eventcb", "(%p, %d, %p)", bev, events, ptr);
+
+    if (events & BEV_EVENT_CONNECTED) {
+        log_debug("ackhole", "ssl connected");
+    } else if (events & BEV_EVENT_ERROR) {
+        log_debug("ackhole", "ssl error");
+    }
+}
+
 void conn_eventcb(struct bufferevent *bev, short events, void *ptr)
 {
     struct flow *fl = ptr;
@@ -627,6 +717,21 @@ void conn_eventcb(struct bufferevent *bev, short events, void *ptr)
     if (events & BEV_EVENT_CONNECTED) {
         log_debug("ackhole", "connected");
         fl->value.connected = 1;
+
+
+        log_trace("conn_eventcb", "base: %p, bev: %p", fl->value.conf->base, fl->value.bev);
+        // Create a TLS bufferevent using this underlying bufferevent
+        fl->value.ssl = SSL_new(fl->value.conf->ssl_ctx);
+        fl->value.ssl_bev = bufferevent_openssl_filter_new(fl->value.conf->base,
+                fl->value.bev, fl->value.ssl, BUFFEREVENT_SSL_CONNECTING, BEV_OPT_CLOSE_ON_FREE);
+
+        log_trace("conn_eventcb", "setup ssl bev");
+        bufferevent_setcb(fl->value.ssl_bev, NULL, NULL, ssl_conn_eventcb, fl);
+        log_trace("conn_eventcb", "setup ssl bev callback");
+        bufferevent_write(fl->value.ssl_bev, HTTP_REQ, strlen(HTTP_REQ));
+
+        log_trace("conn_eventcb", "sent ssl data into bev");
+
     } else if (events & BEV_EVENT_ERROR) {
          /* An error occured while connecting. */
         //cleanup_flow
@@ -646,7 +751,7 @@ void make_conn(struct flow *fl)
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = inet_addr("128.138.200.213");
+    sin.sin_addr.s_addr = inet_addr("0.0.0.0");
     sin.sin_port = htons(0);
 
     // Bind and get our source port for the conn_map
@@ -676,7 +781,7 @@ void make_conn(struct flow *fl)
 
     // Connect to this socket
     sin.sin_addr.s_addr = fl->ip;
-    sin.sin_port = htons(80);
+    sin.sin_port = htons(TCP_PORT);
 
     fl->value.bev = bufferevent_socket_new(conf->base, fl->value.sock, BEV_OPT_CLOSE_ON_FREE);
     if (!fl->value.bev) {
@@ -695,7 +800,7 @@ void make_conn(struct flow *fl)
         return;
     }
 
-    bufferevent_write(fl->value.bev, HTTP_REQ, strlen(HTTP_REQ));
+    //bufferevent_write(fl->value.bev, HTTP_REQ, strlen(HTTP_REQ));
 
 }
 
@@ -834,7 +939,7 @@ int main(int argc,char **argv)
     }
 
     // Compile the filter expression
-    if(pcap_compile(conf.pcap, &bpf, "(tcp and port 80)", 1, PCAP_NETMASK_UNKNOWN) < 0)
+    if(pcap_compile(conf.pcap, &bpf, "(tcp and port 443)", 1, PCAP_NETMASK_UNKNOWN) < 0)
     {
         printf("pcap_compile() failed\n");
         return -1;
@@ -861,6 +966,14 @@ int main(int argc,char **argv)
     conf.base = event_base_new();
 
     log_debug("ackhole", "conf.pcap_fd = %d", conf.pcap_fd);
+    log_trace("ackhole", "conf.base: %p", conf.base);
+
+
+    // Setup TLS
+    if (SSL_library_init() < 0) {
+        log_error("ackhole", "failed to init SSL");
+    }
+    conf.ssl_ctx = SSL_CTX_new(TLSv1_method());
 
     // Event on pcap fd EV_READ
     conf.pcap_ev = event_new(conf.base, conf.pcap_fd, EV_READ|EV_PERSIST, pcap_cb, &conf);
